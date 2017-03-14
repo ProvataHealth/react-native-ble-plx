@@ -207,10 +207,12 @@
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../../../ios/Carthage/Build/iOS",
+					"$(SRCROOT)/../../../../ios/Carthage/Build/iOS",
 				);
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../../react-native/React/**",
+					"$(SRCROOT)/../../../react-native/React",
 					"$(SRCROOT)/../node_modules/react-native/React/**",
 					"$(SRCROOT)/Libraries/**",
 				);
@@ -226,10 +228,12 @@
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../../../ios/Carthage/Build/iOS",
+					"$(SRCROOT)/../../../../ios/Carthage/Build/iOS",
 				);
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../../react-native/React/**",
+					"$(SRCROOT)/../../../react-native/React",
 					"$(SRCROOT)/../node_modules/react-native/React/**",
 					"$(SRCROOT)/Libraries/**",
 				);
