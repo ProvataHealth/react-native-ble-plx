@@ -1,17 +1,16 @@
 package com.polidea.reactnativeble;
 
-import static com.polidea.reactnativeble.utils.Constants.*;
-
-import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.os.Build;
+import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
-import android.support.v4.content.ContextCompat;
-import android.support.v4.util.Pair;
+import android.util.SparseArray;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
@@ -21,17 +20,23 @@ import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableArray;
-import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
-import com.polidea.reactnativeble.converter.JSObjectConverterManager;
+import com.polidea.reactnativeble.converter.RxBleScanResultConverter;
 import com.polidea.reactnativeble.errors.BleError;
+import com.polidea.reactnativeble.errors.Error;
 import com.polidea.reactnativeble.errors.ErrorConverter;
 import com.polidea.reactnativeble.exceptions.CannotMonitorCharacteristicException;
 import com.polidea.reactnativeble.utils.Base64Converter;
 import com.polidea.reactnativeble.utils.DisposableMap;
+import com.polidea.reactnativeble.utils.IdGenerator;
+import com.polidea.reactnativeble.utils.LogLevel;
 import com.polidea.reactnativeble.utils.ReadableArrayConverter;
 import com.polidea.reactnativeble.utils.SafePromise;
 import com.polidea.reactnativeble.utils.UUIDConverter;
+import com.polidea.reactnativeble.wrapper.Characteristic;
+import com.polidea.reactnativeble.wrapper.Device;
+import com.polidea.reactnativeble.wrapper.Service;
+import com.polidea.rxandroidble.NotificationSetupMode;
 import com.polidea.rxandroidble.RxBleAdapterStateObservable;
 import com.polidea.rxandroidble.RxBleClient;
 import com.polidea.rxandroidble.RxBleConnection;
@@ -39,8 +44,11 @@ import com.polidea.rxandroidble.RxBleDevice;
 import com.polidea.rxandroidble.RxBleDeviceServices;
 import com.polidea.rxandroidble.RxBleScanResult;
 import com.polidea.rxandroidble.exceptions.BleCharacteristicNotFoundException;
+import com.polidea.rxandroidble.internal.RxBleLog;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -50,22 +58,47 @@ import rx.Subscription;
 import rx.functions.Action0;
 import rx.functions.Action1;
 import rx.functions.Func1;
-import rx.functions.Func2;
+
+import static com.polidea.reactnativeble.utils.Constants.BluetoothState;
 
 public class BleModule extends ReactContextBaseJavaModule {
 
+    // Name of module
     private static final String NAME = "BleClientManager";
+
+    // Value converters
     private final ErrorConverter errorConverter = new ErrorConverter();
-    private final JSObjectConverterManager converter = new JSObjectConverterManager();
+    private final RxBleScanResultConverter scanConverter = new RxBleScanResultConverter();
 
+    // Manager
+    @Nullable
     private RxBleClient rxBleClient;
-    private HashMap<String, RxBleConnection> connectionMap = new HashMap<>();
 
-    private Subscription scanSubscription;
+    // Map of connected devices.
+    private HashMap<String, Device> connectedDevices = new HashMap<>();
+
+    // Map of discovered services
+    private SparseArray<Service> discoveredServices = new SparseArray<>();
+
+    // Map of discovered characteristics
+    private SparseArray<Characteristic> discoveredCharacteristics = new SparseArray<>();
+
+    // Currently pending transactions
     private final DisposableMap transactions = new DisposableMap();
+
+    // Currently connecting devices
     private final DisposableMap connectingDevices = new DisposableMap();
 
+    // Scan subscription
+    @Nullable
+    private Subscription scanSubscription;
+
+    // State subscription
+    @Nullable
     private Subscription adapterStateChangesSubscription;
+
+    // Current native library log level.
+    private int currentLogLevel = RxBleLog.NONE;
 
     public BleModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -88,15 +121,24 @@ public class BleModule extends ReactContextBaseJavaModule {
     // Lifecycle -----------------------------------------------------------------------------------
 
     @ReactMethod
-    public void createClient() {
+    public void createClient(String restoreStateIdentifier) {
         final ReactApplicationContext context = getReactApplicationContext();
         rxBleClient = RxBleClient.create(context);
         adapterStateChangesSubscription = monitorAdapterStateChanges(context);
+
+        // We need to send signal that BLE Module starts without restored state
+        if (restoreStateIdentifier != null) {
+            sendEvent(Event.RestoreStateEvent, null);
+        }
     }
 
     @ReactMethod
     public void destroyClient() {
-        // Clear all subscriptions
+        // Subscriptions
+        if (adapterStateChangesSubscription != null) {
+            adapterStateChangesSubscription.unsubscribe();
+            adapterStateChangesSubscription = null;
+        }
         if (scanSubscription != null && !scanSubscription.isUnsubscribed()) {
             scanSubscription.unsubscribe();
             scanSubscription = null;
@@ -104,17 +146,14 @@ public class BleModule extends ReactContextBaseJavaModule {
         transactions.removeAllSubscriptions();
         connectingDevices.removeAllSubscriptions();
 
-        // Clear all data structures
-        connectionMap.clear();
+        // Caches
+        discoveredServices.clear();
+        discoveredCharacteristics.clear();
+        connectedDevices.clear();
 
         // Clear client
         rxBleClient = null;
-
-        // Stop monitoring adapter changes
-        if (adapterStateChangesSubscription != null) {
-            adapterStateChangesSubscription.unsubscribe();
-            adapterStateChangesSubscription = null;
-        }
+        IdGenerator.clear();
     }
 
     @Override
@@ -128,6 +167,17 @@ public class BleModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void cancelTransaction(String transactionId) {
         transactions.removeSubscription(transactionId);
+    }
+
+    @ReactMethod
+    public void setLogLevel(String logLevel) {
+        currentLogLevel = LogLevel.toLogLevel(logLevel);
+        RxBleClient.setLogLevel(currentLogLevel);
+    }
+
+    @ReactMethod
+    public void logLevel(Promise promise) {
+        promise.resolve(LogLevel.fromLogLevel(currentLogLevel));
     }
 
     // Mark: Monitoring state ----------------------------------------------------------------------
@@ -161,6 +211,9 @@ public class BleModule extends ReactContextBaseJavaModule {
 
         final ReactApplicationContext context = getReactApplicationContext();
         final BluetoothManager bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+        if (bluetoothManager == null) {
+            return BluetoothState.POWERED_OFF;
+        }
         final BluetoothAdapter bluetoothAdapter = bluetoothManager.getAdapter();
         return nativeAdapterStateToReactNativeBluetoothState(bluetoothAdapter.getState());
     }
@@ -216,12 +269,15 @@ public class BleModule extends ReactContextBaseJavaModule {
     }
 
     private void safeStartDeviceScan(final UUID[] uuids) {
+        if (rxBleClient == null) {
+            throw new IllegalStateException("BleManager not created when tried to start device scan");
+        }
         scanSubscription = rxBleClient
                 .scanBleDevices(uuids)
                 .subscribe(new Action1<RxBleScanResult>() {
                     @Override
                     public void call(RxBleScanResult rxBleScanResult) {
-                        sendEvent(Event.ScanEvent, converter.scanResult.toJSCallback(rxBleScanResult));
+                        sendEvent(Event.ScanEvent, scanConverter.toJSCallback(rxBleScanResult));
                     }
                 }, new Action1<Throwable>() {
                     @Override
@@ -241,11 +297,103 @@ public class BleModule extends ReactContextBaseJavaModule {
         }
     }
 
-    // Mark: Connection management -----------------------------------------------------------------
+    // Mark: Device operations ---------------------------------------------------------------------
+
+    @ReactMethod
+    public void requestMTUForDevice(final String deviceId, int mtu, final String transactionId, final Promise promise) {
+        final Device device = getDeviceOrReject(deviceId, promise);
+        if (device == null) {
+            return;
+        }
+
+        final RxBleConnection connection = getConnectionOrReject(device, promise);
+        if (connection == null) {
+            return;
+        }
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+            final SafePromise safePromise = new SafePromise(promise);
+            final Subscription subscription = connection
+                    .requestMtu(mtu)
+                    .doOnUnsubscribe(new Action0() {
+                        @Override
+                        public void call() {
+                            BleError.cancelled().reject(safePromise);
+                            transactions.removeSubscription(transactionId);
+                        }
+                    }).subscribe(new Observer<Integer>() {
+                        @Override
+                        public void onCompleted() {
+                            transactions.removeSubscription(transactionId);
+                        }
+
+                        @Override
+                        public void onError(Throwable e) {
+                            errorConverter.toError(e).reject(safePromise);
+                            transactions.removeSubscription(transactionId);
+                        }
+
+                        @Override
+                        public void onNext(Integer integer) {
+                            safePromise.resolve(device.toJSObject(null));
+                        }
+                    });
+
+            transactions.replaceSubscription(transactionId, subscription);
+        } else {
+            promise.resolve(device.toJSObject(null));
+        }
+    }
+
+    @ReactMethod
+    public void readRSSIForDevice(final String deviceId, final String transactionId, final Promise promise) {
+        final Device device = getDeviceOrReject(deviceId, promise);
+        if (device == null) {
+            return;
+        }
+        final RxBleConnection connection = getConnectionOrReject(device, promise);
+        if (connection == null) {
+            return;
+        }
+
+        final SafePromise safePromise = new SafePromise(promise);
+        final Subscription subscription = connection
+                .readRssi()
+                .doOnUnsubscribe(new Action0() {
+                    @Override
+                    public void call() {
+                        BleError.cancelled().reject(safePromise);
+                        transactions.removeSubscription(transactionId);
+                    }
+                })
+                .subscribe(new Observer<Integer>() {
+                    @Override
+                    public void onCompleted() {
+                        transactions.removeSubscription(transactionId);
+                    }
+
+                    @Override
+                    public void onError(Throwable e) {
+                        errorConverter.toError(e).reject(safePromise);
+                        transactions.removeSubscription(transactionId);
+                    }
+
+                    @Override
+                    public void onNext(Integer rssi) {
+                        safePromise.resolve(device.toJSObject(rssi));
+                    }
+                });
+
+        transactions.replaceSubscription(transactionId, subscription);
+    }
 
     @ReactMethod
     public void connectToDevice(final String deviceId, @Nullable ReadableMap options, final Promise promise) {
         final SafePromise safePromise = new SafePromise(promise);
+
+        if (rxBleClient == null) {
+            throw new IllegalStateException("BleManager not created when tried connecting to device");
+        }
 
         final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
         if (device == null) {
@@ -254,23 +402,53 @@ public class BleModule extends ReactContextBaseJavaModule {
         }
 
         boolean autoConnect = false;
+        int requestMtu = 0;
+
         if (options != null) {
-            autoConnect = options.getBoolean("autoConnect");
+            if (options.hasKey("autoConnect")) {
+                autoConnect = options.getBoolean("autoConnect");
+            }
+            if (options.hasKey("requestMTU")) {
+                requestMtu = options.getInt("requestMTU");
+            }
         }
 
-        safeConnectToDevice(device, autoConnect, new SafePromise(promise));
+        safeConnectToDevice(device, autoConnect, requestMtu, new SafePromise(promise));
     }
 
-    private void safeConnectToDevice(final RxBleDevice device, boolean autoConnect, final SafePromise promise) {
-        final Subscription subscription = device
-                .establishConnection(getReactApplicationContext(), autoConnect)
+    private void safeConnectToDevice(final RxBleDevice device, boolean autoConnect, final int requestMtu, final SafePromise promise) {
+
+        Observable<RxBleConnection> connect = device
+                .establishConnection(autoConnect)
                 .doOnUnsubscribe(new Action0() {
                     @Override
                     public void call() {
                         BleError.cancelled().reject(promise);
-                        onDeviceDisconnected(device);
+                        onDeviceDisconnected(device, null);
                     }
-                })
+                });
+
+        if (requestMtu > 0) {
+            connect = connect.flatMap(new Func1<RxBleConnection, Observable<RxBleConnection>>() {
+                @Override
+                public Observable<RxBleConnection> call(final RxBleConnection rxBleConnection) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        return rxBleConnection
+                                .requestMtu(requestMtu)
+                                .map(new Func1<Integer, RxBleConnection>() {
+                                    @Override
+                                    public RxBleConnection call(Integer integer) {
+                                        return rxBleConnection;
+                                    }
+                                });
+                    } else {
+                        return Observable.just(rxBleConnection);
+                    }
+                }
+            });
+        }
+
+        final Subscription subscription = connect
                 .subscribe(new Observer<RxBleConnection>() {
                     @Override
                     public void onCompleted() {
@@ -278,33 +456,51 @@ public class BleModule extends ReactContextBaseJavaModule {
 
                     @Override
                     public void onError(Throwable e) {
-                        errorConverter.toError(e).reject(promise);
-                        onDeviceDisconnected(device);
+                        Error error = errorConverter.toError(e);
+                        error.reject(promise);
+                        onDeviceDisconnected(device, error);
                     }
 
                     @Override
                     public void onNext(RxBleConnection connection) {
-                        connectionMap.put(device.getMacAddress(), connection);
-                        promise.resolve(converter.device.toJSObject(device));
+                        Device jsDevice = new Device(device, connection);
+                        cleanServicesAndCharacteristicsForDevice(jsDevice);
+                        connectedDevices.put(device.getMacAddress(), jsDevice);
+                        promise.resolve(jsDevice.toJSObject(null));
                     }
                 });
 
         connectingDevices.replaceSubscription(device.getMacAddress(), subscription);
     }
 
-    // TODO: Consider passing error if available
-    private void onDeviceDisconnected(RxBleDevice device) {
+    private void onDeviceDisconnected(RxBleDevice device, Error error) {
+        Device jsDevice = connectedDevices.remove(device.getMacAddress());
+        if (jsDevice == null) {
+            return;
+        }
+
+        cleanServicesAndCharacteristicsForDevice(jsDevice);
+        WritableArray event = Arguments.createArray();
+        if (error != null) {
+            event.pushMap(error.toJS());
+        } else {
+            event.pushNull();
+        }
+        event.pushMap(jsDevice.toJSObject(null));
+        sendEvent(Event.DisconnectionEvent, event);
         connectingDevices.removeSubscription(device.getMacAddress());
-        connectionMap.remove(device.getMacAddress());
-        sendEvent(Event.DisconnectionEvent, converter.device.toJSCallback(device));
     }
 
     @ReactMethod
     public void cancelDeviceConnection(String deviceId, Promise promise) {
+        if (rxBleClient == null) {
+            throw new IllegalStateException("BleManager not created when tried cancel device connection");
+        }
+
         final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
 
         if (connectingDevices.removeSubscription(deviceId) && device != null) {
-            promise.resolve(converter.device.toJSObject(device));
+            promise.resolve(new Device(device, null).toJSObject(null));
         } else {
             if (device == null) {
                 BleError.deviceNotFound(deviceId).reject(promise);
@@ -316,6 +512,10 @@ public class BleModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void isDeviceConnected(String deviceId, Promise promise) {
+        if (rxBleClient == null) {
+            throw new IllegalStateException("BleManager not created when tried cancel device connection");
+        }
+
         final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
         if (device == null) {
             BleError.deviceNotFound(deviceId).reject(promise);
@@ -331,102 +531,78 @@ public class BleModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void discoverAllServicesAndCharacteristicsForDevice(String deviceId, final Promise promise) {
-        final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
+        final Device device = getDeviceOrReject(deviceId, promise);
         if (device == null) {
-            BleError.deviceNotFound(deviceId).reject(promise);
             return;
         }
 
-        final RxBleConnection rxBleConnection = connectionMap.get(deviceId);
-        if (rxBleConnection == null) {
-            BleError.deviceNotConnected(deviceId).reject(promise);
-            return;
-        }
-
-        safeDiscoverAllServicesAndCharacteristicsForDevice(rxBleConnection, device, new SafePromise(promise));
+        safeDiscoverAllServicesAndCharacteristicsForDevice(device, new SafePromise(promise));
     }
 
     // TODO: Transaction for subscription (allows to cancel)
-    private void safeDiscoverAllServicesAndCharacteristicsForDevice(final RxBleConnection connection,
-                                                                    final RxBleDevice device,
+    private void safeDiscoverAllServicesAndCharacteristicsForDevice(final Device device,
                                                                     final SafePromise promise) {
-        connection.discoverServices().subscribe(new Observer<RxBleDeviceServices>() {
-            @Override
-            public void onCompleted() {
-                promise.resolve(converter.device.toJSObject(device));
-            }
+        final RxBleConnection connection = getConnectionOrReject(device, promise);
+        if (connection == null) {
+            return;
+        }
 
-            @Override
-            public void onError(Throwable e) {
-                errorConverter.toError(e).reject(promise);
-            }
+        connection
+                .discoverServices()
+                .subscribe(new Observer<RxBleDeviceServices>() {
+                    @Override
+                    public void onCompleted() {
+                        promise.resolve(device.toJSObject(null));
+                    }
 
-            @Override
-            public void onNext(RxBleDeviceServices rxBleDeviceServices) {
+                    @Override
+                    public void onError(Throwable e) {
+                        errorConverter.toError(e).reject(promise);
+                    }
 
-            }
-        });
+                    @Override
+                    public void onNext(RxBleDeviceServices rxBleDeviceServices) {
+                        ArrayList<Service> services = new ArrayList<>();
+                        for (BluetoothGattService gattService : rxBleDeviceServices.getBluetoothGattServices()) {
+                            Service service = new Service(device, gattService);
+                            discoveredServices.put(service.getId(), service);
+                            services.add(service);
+
+                            for (BluetoothGattCharacteristic gattCharacteristic : gattService.getCharacteristics()) {
+                                Characteristic characteristic = new Characteristic(service, gattCharacteristic);
+                                discoveredCharacteristics.put(characteristic.getId(), characteristic);
+                            }
+                        }
+                        device.setServices(services);
+                    }
+                });
     }
 
     // Mark: Service and characteristic getters ----------------------------------------------------
 
     @ReactMethod
     public void servicesForDevice(final String deviceId, final Promise promise) {
-        final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
+        final Device device = getDeviceOrReject(deviceId, promise);
         if (device == null) {
-            BleError.deviceNotFound(deviceId).reject(promise);
+            return;
+        }
+        final List<Service> services = getServicesOrReject(device, promise);
+        if (services == null) {
             return;
         }
 
-        final RxBleConnection rxBleConnection = connectionMap.get(deviceId);
-        if (rxBleConnection == null) {
-            BleError.deviceNotConnected(deviceId).reject(promise);
-            return;
+        WritableArray jsServices = Arguments.createArray();
+        for (Service service : services) {
+            jsServices.pushMap(service.toJSObject());
         }
 
-        safeServicesForDevice(rxBleConnection, device, new SafePromise(promise));
-    }
-
-    // TODO: Consider subscription
-    private void safeServicesForDevice(RxBleConnection connection, final RxBleDevice device, final SafePromise promise) {
-        connection.discoverServices()
-                .subscribe(new Observer<RxBleDeviceServices>() {
-                    @Override
-                    public void onCompleted() {
-
-                    }
-
-                    @Override
-                    public void onError(Throwable e) {
-                        BleError.deviceNotFound(device.getMacAddress()).reject(promise);
-                    }
-
-                    @Override
-                    public void onNext(RxBleDeviceServices bluetoothGattServices) {
-                        WritableArray jsServices = Arguments.createArray();
-                        for (BluetoothGattService service : bluetoothGattServices.getBluetoothGattServices()) {
-                            WritableMap jsService = converter.service.toJSObject(service);
-                            jsService.putString("deviceID", device.getMacAddress());
-                            jsServices.pushMap(jsService);
-                        }
-                        promise.resolve(jsServices);
-                    }
-                });
+        promise.resolve(jsServices);
     }
 
     @ReactMethod
-    public void characteristicsForDevice(final String deviceId, final String serviceUUID, final Promise promise) {
-        final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
-        if (device == null) {
-            BleError.deviceNotFound(deviceId).reject(promise);
-            return;
-        }
-
-        final RxBleConnection rxBleConnection = connectionMap.get(deviceId);
-        if (rxBleConnection == null) {
-            BleError.deviceNotConnected(deviceId).reject(promise);
-            return;
-        }
+    public void characteristicsForDevice(final String deviceId,
+                                         final String serviceUUID,
+                                         final Promise promise) {
 
         final UUID convertedServiceUUID = UUIDConverter.convert(serviceUUID);
         if (convertedServiceUUID == null) {
@@ -434,51 +610,37 @@ public class BleModule extends ReactContextBaseJavaModule {
             return;
         }
 
-        safeCharacteristicsForDevice(rxBleConnection, device, convertedServiceUUID, new SafePromise(promise));
+        final Device device = getDeviceOrReject(deviceId, promise);
+        if (device == null) {
+            return;
+        }
+
+        final Service service = device.getServiceByUUID(convertedServiceUUID);
+        if (service == null) {
+            BleError.serviceNotFound(serviceUUID).reject(promise);
+            return;
+        }
+
+        characteristicsForService(service, promise);
     }
 
-    private void safeCharacteristicsForDevice(final RxBleConnection connection,
-                                              final RxBleDevice device,
-                                              final UUID serviceUUID,
-                                              final SafePromise promise) {
-        connection.discoverServices()
-                .subscribe(new Observer<RxBleDeviceServices>() {
-                    @Override
-                    public void onCompleted() {
+    @ReactMethod
+    public void characteristicsForService(final int serviceIdentifier, final Promise promise) {
+        Service service = discoveredServices.get(serviceIdentifier);
+        if (service == null) {
+            BleError.serviceNotFound(serviceIdentifier).reject(promise);
+            return;
+        }
 
-                    }
+        characteristicsForService(service, promise);
+    }
 
-                    @Override
-                    public void onError(Throwable e) {
-                        BleError.deviceNotFound(device.getMacAddress()).reject(promise);
-                    }
-
-                    @Override
-                    public void onNext(RxBleDeviceServices bluetoothGattServices) {
-                        BluetoothGattService foundService = null;
-                        for (BluetoothGattService service : bluetoothGattServices.getBluetoothGattServices()) {
-                            if (service.getUuid().equals(serviceUUID)) {
-                                foundService = service;
-                                break;
-                            }
-                        }
-
-                        if (foundService == null) {
-                            BleError.serviceNotFound(UUIDConverter.fromUUID(serviceUUID)).reject(promise);
-                            return;
-                        }
-
-                        WritableArray jsCharacteristics = Arguments.createArray();
-                        for (BluetoothGattCharacteristic characteristic : foundService.getCharacteristics()) {
-                            WritableMap value = converter.characteristic.toJSObject(characteristic);
-                            value.putString("deviceID", device.getMacAddress());
-                            value.putString("serviceUUID", UUIDConverter.fromUUID(serviceUUID));
-                            jsCharacteristics.pushMap(value);
-                        }
-
-                        promise.resolve(jsCharacteristics);
-                    }
-                });
+    private void characteristicsForService(final Service service, final Promise promise) {
+        WritableArray jsCharacteristics = Arguments.createArray();
+        for (Characteristic characteristic : service.getCharacteristics()) {
+            jsCharacteristics.pushMap(characteristic.toJSObject(null));
+        }
+        promise.resolve(jsCharacteristics);
     }
 
     // Mark: Characteristics operations ------------------------------------------------------------
@@ -492,75 +654,97 @@ public class BleModule extends ReactContextBaseJavaModule {
                                              final String transactionId,
                                              final Promise promise) {
 
-        final SafePromise safePromise = new SafePromise(promise);
-
-        final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
-        if (device == null) {
-            BleError.deviceNotFound(deviceId).reject(safePromise);
+        final Characteristic characteristic = getCharacteristicOrReject(
+                deviceId, serviceUUID, characteristicUUID, promise);
+        if (characteristic == null) {
             return;
         }
 
-        final RxBleConnection rxBleConnection = connectionMap.get(deviceId);
-        if (rxBleConnection == null) {
-            BleError.deviceNotConnected(deviceId).reject(safePromise);
+        writeCharacteristicWithValue(
+                characteristic,
+                valueBase64,
+                response,
+                transactionId,
+                promise);
+    }
+
+    @ReactMethod
+    public void writeCharacteristicForService(final int serviceIdentifier,
+                                              final String characteristicUUID,
+                                              final String valueBase64,
+                                              final Boolean response,
+                                              final String transactionId,
+                                              final Promise promise) {
+        final Characteristic characteristic = getCharacteristicOrReject(
+                serviceIdentifier, characteristicUUID, promise);
+        if (characteristic == null) {
             return;
         }
 
-        final UUID[] UUIDs = UUIDConverter.convert(serviceUUID, characteristicUUID);
-        if (UUIDs == null) {
-            BleError.invalidUUIDs(serviceUUID, characteristicUUID).reject(safePromise);
+        writeCharacteristicWithValue(
+                characteristic,
+                valueBase64,
+                response,
+                transactionId,
+                promise);
+    }
+
+    @ReactMethod
+    public void writeCharacteristic(final int characteristicIdentifier,
+                                    final String valueBase64,
+                                    final Boolean response,
+                                    final String transactionId,
+                                    final Promise promise) {
+        final Characteristic characteristic = getCharacteristicOrReject(characteristicIdentifier, promise);
+        if (characteristic == null) {
             return;
         }
 
+        writeCharacteristicWithValue(
+                characteristic,
+                valueBase64,
+                response,
+                transactionId,
+                promise);
+    }
+
+    private void writeCharacteristicWithValue(final Characteristic characteristic,
+                                              final String valueBase64,
+                                              final Boolean response,
+                                              final String transactionId,
+                                              final Promise promise) {
         final byte[] value;
         try {
             value = Base64Converter.decode(valueBase64);
         } catch (Throwable e) {
-            BleError.invalidWriteDataForCharacteristic(valueBase64, characteristicUUID).reject(safePromise);
+            BleError.invalidWriteDataForCharacteristic(valueBase64,
+                    UUIDConverter.fromUUID(characteristic.getNativeCharacteristic().getUuid()))
+                    .reject(promise);
             return;
         }
 
+        characteristic.getNativeCharacteristic()
+                .setWriteType(response ?
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT :
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+
         safeWriteCharacteristicForDevice(
-                rxBleConnection,
-                device,
-                UUIDs[0],
-                UUIDs[1],
+                characteristic,
                 value,
-                response == null ? false : response,
                 transactionId,
                 new SafePromise(promise));
     }
 
-    private void safeWriteCharacteristicForDevice(final RxBleConnection connection,
-                                                  final RxBleDevice device,
-                                                  final UUID serviceUUID,
-                                                  final UUID characteristicUUID,
+    private void safeWriteCharacteristicForDevice(final Characteristic characteristic,
                                                   final byte[] value,
-                                                  final boolean response,
                                                   final String transactionId,
                                                   final SafePromise promise) {
-        final Subscription subscription = connection.discoverServices()
-                .flatMap(new Func1<RxBleDeviceServices, Observable<BluetoothGattCharacteristic>>() {
-                    @Override
-                    public Observable<BluetoothGattCharacteristic> call(RxBleDeviceServices rxBleDeviceServices) {
-                        return rxBleDeviceServices.getCharacteristic(serviceUUID, characteristicUUID);
-                    }
-                })
-                .flatMap(new Func1<BluetoothGattCharacteristic, Observable<byte[]>>() {
-                    @Override
-                    public Observable<byte[]> call(BluetoothGattCharacteristic bluetoothGattCharacteristic) {
-                        bluetoothGattCharacteristic.setWriteType(
-                                response ?
-                                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT :
-                                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
-                        return connection.writeCharacteristic(bluetoothGattCharacteristic, value);
-                    }
-                }, new Func2<BluetoothGattCharacteristic, byte[], Pair<BluetoothGattCharacteristic, byte[]>>() {
-                    @Override
-                    public Pair<BluetoothGattCharacteristic, byte[]> call(BluetoothGattCharacteristic bluetoothGattCharacteristic, byte[] bytes) {
-                        return new Pair<>(bluetoothGattCharacteristic, bytes);
-                    }
-                })
+        final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+        if (connection == null) {
+            return;
+        }
+        final Subscription subscription = connection
+                .writeCharacteristic(characteristic.getNativeCharacteristic(), value)
                 .doOnUnsubscribe(new Action0() {
                     @Override
                     public void call() {
@@ -568,7 +752,7 @@ public class BleModule extends ReactContextBaseJavaModule {
                         transactions.removeSubscription(transactionId);
                     }
                 })
-                .subscribe(new Observer<Pair<BluetoothGattCharacteristic, byte[]>>() {
+                .subscribe(new Observer<byte[]>() {
                     @Override
                     public void onCompleted() {
                         transactions.removeSubscription(transactionId);
@@ -577,7 +761,10 @@ public class BleModule extends ReactContextBaseJavaModule {
                     @Override
                     public void onError(Throwable e) {
                         if (e instanceof BleCharacteristicNotFoundException) {
-                            BleError.characteristicNotFound(UUIDConverter.fromUUID(characteristicUUID)).reject(promise);
+                            BleError.characteristicNotFound(
+                                    UUIDConverter.fromUUID(
+                                            characteristic.getNativeCharacteristic().getUuid()))
+                                    .reject(promise);
                             return;
                         }
                         errorConverter.toError(e).reject(promise);
@@ -585,12 +772,9 @@ public class BleModule extends ReactContextBaseJavaModule {
                     }
 
                     @Override
-                    public void onNext(Pair<BluetoothGattCharacteristic, byte[]> result) {
-                        WritableMap jsObject = converter.characteristic.toJSObject(result.first);
-                        jsObject.putString("deviceID", device.getMacAddress());
-                        jsObject.putString("serviceUUID", UUIDConverter.fromUUID(serviceUUID));
-                        jsObject.putString("value", Base64Converter.encode(result.second));
-                        promise.resolve(jsObject);
+                    public void onNext(byte[] bytes) {
+                        characteristic.logValue("Write to", bytes);
+                        promise.resolve(characteristic.toJSObject(bytes));
                     }
                 });
 
@@ -603,60 +787,55 @@ public class BleModule extends ReactContextBaseJavaModule {
                                             final String characteristicUUID,
                                             final String transactionId,
                                             final Promise promise) {
-        final SafePromise safePromise = new SafePromise(promise);
 
-        final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
-        if (device == null) {
-            BleError.deviceNotFound(deviceId).reject(safePromise);
+        final Characteristic characteristic = getCharacteristicOrReject(
+                deviceId, serviceUUID, characteristicUUID, promise);
+        if (characteristic == null) {
             return;
         }
 
-        final RxBleConnection rxBleConnection = connectionMap.get(deviceId);
-        if (rxBleConnection == null) {
-            BleError.deviceNotConnected(deviceId).reject(safePromise);
-            return;
-        }
-
-        final UUID[] UUIDs = UUIDConverter.convert(serviceUUID, characteristicUUID);
-        if (UUIDs == null) {
-            BleError.invalidUUIDs(serviceUUID, characteristicUUID).reject(safePromise);
-            return;
-        }
-
-        safeReadCharacteristicForDevice(
-                rxBleConnection,
-                device,
-                UUIDs[0],
-                UUIDs[1],
-                transactionId,
-                new SafePromise(promise));
+        safeReadCharacteristicForDevice(characteristic, transactionId, new SafePromise(promise));
     }
 
-    private void safeReadCharacteristicForDevice(final RxBleConnection connection,
-                                                 final RxBleDevice device,
-                                                 final UUID serviceUUID,
-                                                 final UUID characteristicUUID,
+    @ReactMethod
+    public void readCharacteristicForService(final int serviceIdentifier,
+                                             final String characteristicUUID,
+                                             final String transactionId,
+                                             final Promise promise) {
+
+        final Characteristic characteristic = getCharacteristicOrReject(
+                serviceIdentifier, characteristicUUID, promise);
+        if (characteristic == null) {
+            return;
+        }
+
+        safeReadCharacteristicForDevice(characteristic, transactionId, new SafePromise(promise));
+    }
+
+    @ReactMethod
+    public void readCharacteristic(final int characteristicIdentifier,
+                                   final String transactionId,
+                                   final Promise promise) {
+
+        final Characteristic characteristic = getCharacteristicOrReject(characteristicIdentifier, promise);
+        if (characteristic == null) {
+            return;
+        }
+
+        safeReadCharacteristicForDevice(characteristic, transactionId, new SafePromise(promise));
+    }
+
+
+    private void safeReadCharacteristicForDevice(final Characteristic characteristic,
                                                  final String transactionId,
                                                  final SafePromise promise) {
+        final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+        if (connection == null) {
+            return;
+        }
 
-        final Subscription subscription = connection.discoverServices()
-                .flatMap(new Func1<RxBleDeviceServices, Observable<BluetoothGattCharacteristic>>() {
-                    @Override
-                    public Observable<BluetoothGattCharacteristic> call(RxBleDeviceServices rxBleDeviceServices) {
-                        return rxBleDeviceServices.getCharacteristic(serviceUUID, characteristicUUID);
-                    }
-                })
-                .flatMap(new Func1<BluetoothGattCharacteristic, Observable<byte[]>>() {
-                    @Override
-                    public Observable<byte[]> call(BluetoothGattCharacteristic bluetoothGattCharacteristic) {
-                        return connection.readCharacteristic(bluetoothGattCharacteristic);
-                    }
-                }, new Func2<BluetoothGattCharacteristic, byte[], Pair<BluetoothGattCharacteristic, byte[]>>() {
-                    @Override
-                    public Pair<BluetoothGattCharacteristic, byte[]> call(BluetoothGattCharacteristic bluetoothGattCharacteristic, byte[] bytes) {
-                        return new Pair<>(bluetoothGattCharacteristic, bytes);
-                    }
-                })
+        final Subscription subscription = connection
+                .readCharacteristic(characteristic.getNativeCharacteristic())
                 .doOnUnsubscribe(new Action0() {
                     @Override
                     public void call() {
@@ -664,7 +843,7 @@ public class BleModule extends ReactContextBaseJavaModule {
                         transactions.removeSubscription(transactionId);
                     }
                 })
-                .subscribe(new Observer<Pair<BluetoothGattCharacteristic, byte[]>>() {
+                .subscribe(new Observer<byte[]>() {
                     @Override
                     public void onCompleted() {
                         transactions.removeSubscription(transactionId);
@@ -673,7 +852,10 @@ public class BleModule extends ReactContextBaseJavaModule {
                     @Override
                     public void onError(Throwable e) {
                         if (e instanceof BleCharacteristicNotFoundException) {
-                            BleError.characteristicNotFound(UUIDConverter.fromUUID(characteristicUUID)).reject(promise);
+                            BleError.characteristicNotFound(
+                                    UUIDConverter.fromUUID(
+                                            characteristic.getNativeCharacteristic().getUuid()))
+                                    .reject(promise);
                             return;
                         }
                         errorConverter.toError(e).reject(promise);
@@ -681,12 +863,9 @@ public class BleModule extends ReactContextBaseJavaModule {
                     }
 
                     @Override
-                    public void onNext(Pair<BluetoothGattCharacteristic, byte[]> result) {
-                        WritableMap jsObject = converter.characteristic.toJSObject(result.first);
-                        jsObject.putString("deviceID", device.getMacAddress());
-                        jsObject.putString("serviceUUID", UUIDConverter.fromUUID(serviceUUID));
-                        jsObject.putString("value", Base64Converter.encode(result.second));
-                        promise.resolve(jsObject);
+                    public void onNext(byte[] bytes) {
+                        characteristic.logValue("Read from", bytes);
+                        promise.resolve(characteristic.toJSObject(bytes));
                     }
                 });
 
@@ -699,76 +878,84 @@ public class BleModule extends ReactContextBaseJavaModule {
                                                final String characteristicUUID,
                                                final String transactionId,
                                                final Promise promise) {
-        final RxBleDevice device = rxBleClient.getBleDevice(deviceId);
-        if (device == null) {
-            BleError.deviceNotFound(deviceId).reject(promise);
+
+        final Characteristic characteristic = getCharacteristicOrReject(
+                deviceId, serviceUUID, characteristicUUID, promise);
+        if (characteristic == null) {
             return;
         }
 
-        final RxBleConnection rxBleConnection = connectionMap.get(deviceId);
-        if (rxBleConnection == null) {
-            BleError.deviceNotConnected(deviceId).reject(promise);
-            return;
-        }
-
-        final UUID[] UUIDs = UUIDConverter.convert(serviceUUID, characteristicUUID);
-        if (UUIDs == null) {
-            BleError.invalidUUIDs(serviceUUID, characteristicUUID).reject(promise);
-            return;
-        }
-
-        safeMonitorCharacteristicForDevice(
-                rxBleConnection,
-                device,
-                UUIDs[0],
-                UUIDs[1],
-                transactionId,
-                new SafePromise(promise));
+        safeMonitorCharacteristicForDevice(characteristic, transactionId, new SafePromise(promise));
     }
 
-    private void safeMonitorCharacteristicForDevice(final RxBleConnection connection,
-                                                    final RxBleDevice device,
-                                                    final UUID serviceUUID,
-                                                    final UUID characteristicUUID,
+    @ReactMethod
+    public void monitorCharacteristicForService(final int serviceIdentifier,
+                                                final String characteristicUUID,
+                                                final String transactionId,
+                                                final Promise promise) {
+
+        final Characteristic characteristic = getCharacteristicOrReject(
+                serviceIdentifier, characteristicUUID, promise);
+        if (characteristic == null) {
+            return;
+        }
+
+        safeMonitorCharacteristicForDevice(characteristic, transactionId, new SafePromise(promise));
+    }
+
+    @ReactMethod
+    public void monitorCharacteristic(final int characteristicIdentifier,
+                                      final String transactionId,
+                                      final Promise promise) {
+
+        final Characteristic characteristic = getCharacteristicOrReject(characteristicIdentifier, promise);
+        if (characteristic == null) {
+            return;
+        }
+
+        safeMonitorCharacteristicForDevice(characteristic, transactionId, new SafePromise(promise));
+    }
+
+    private void safeMonitorCharacteristicForDevice(final Characteristic characteristic,
                                                     final String transactionId,
                                                     final SafePromise promise) {
+        final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+        if (connection == null) {
+            return;
+        }
 
-        final Subscription subscription = connection.discoverServices()
-                .flatMap(new Func1<RxBleDeviceServices, Observable<BluetoothGattCharacteristic>>() {
+        final BluetoothGattCharacteristic gattCharacteristic = characteristic.getNativeCharacteristic();
+
+        final int properties = gattCharacteristic.getProperties();
+        final boolean notifications = (properties & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0;
+        final boolean indications = (properties & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0;
+
+        final Subscription subscription = Observable.just(connection)
+                .flatMap(new Func1<RxBleConnection, Observable<Observable<byte[]>>>() {
                     @Override
-                    public Observable<BluetoothGattCharacteristic> call(RxBleDeviceServices rxBleDeviceServices) {
-                        return rxBleDeviceServices.getCharacteristic(serviceUUID, characteristicUUID);
-                    }
-                })
-                .flatMap(new Func1<BluetoothGattCharacteristic, Observable<Observable<byte[]>>>() {
-                    @Override
-                    public Observable<Observable<byte[]>> call(BluetoothGattCharacteristic bluetoothGattCharacteristic) {
-                        int properties = bluetoothGattCharacteristic.getProperties();
-                        if ((properties & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
-                            return connection.setupNotification(bluetoothGattCharacteristic);
+                    public Observable<Observable<byte[]>> call(RxBleConnection connection) {
+                        if (notifications || indications) {
+                            // NotificationSetupMode.COMPAT does not write CCC Descriptor on it's own
+                            return connection.setupNotification(gattCharacteristic, NotificationSetupMode.COMPAT);
                         }
 
-                        if ((properties & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
-                            return connection.setupIndication(bluetoothGattCharacteristic);
-                        }
-
-                        return Observable.error(new CannotMonitorCharacteristicException(bluetoothGattCharacteristic));
-                    }
-                }, new Func2<BluetoothGattCharacteristic, Observable<byte[]>, Pair<BluetoothGattCharacteristic, Observable<byte[]>>>() {
-                    @Override
-                    public Pair<BluetoothGattCharacteristic, Observable<byte[]>> call(BluetoothGattCharacteristic bluetoothGattCharacteristic, Observable<byte[]> observable) {
-                        return new Pair<>(bluetoothGattCharacteristic, observable);
+                        return Observable.error(new CannotMonitorCharacteristicException(gattCharacteristic));
                     }
                 })
-                .flatMap(new Func1<Pair<BluetoothGattCharacteristic, Observable<byte[]>>, Observable<byte[]>>() {
+                .flatMap(new Func1<Observable<byte[]>, Observable<byte[]>>() {
                     @Override
-                    public Observable<byte[]> call(Pair<BluetoothGattCharacteristic, Observable<byte[]>> bluetoothGattCharacteristicObservablePair) {
-                        return bluetoothGattCharacteristicObservablePair.second;
-                    }
-                }, new Func2<Pair<BluetoothGattCharacteristic, Observable<byte[]>>, byte[], Pair<BluetoothGattCharacteristic, byte[]>>() {
-                    @Override
-                    public Pair<BluetoothGattCharacteristic, byte[]> call(Pair<BluetoothGattCharacteristic, Observable<byte[]>> bluetoothGattCharacteristicObservablePair, byte[] bytes) {
-                        return new Pair<>(bluetoothGattCharacteristicObservablePair.first, bytes);
+                    public Observable<byte[]> call(Observable<byte[]> observable) {
+                        BluetoothGattDescriptor cccDescriptor =
+                                gattCharacteristic.getDescriptor(Characteristic.CLIENT_CHARACTERISTIC_CONFIG_UUID);
+                        if (cccDescriptor == null) {
+                            return observable;
+                        } else {
+                            byte[] enableValue = notifications
+                                    ? BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                    : BluetoothGattDescriptor.ENABLE_INDICATION_VALUE;
+                            // Keep in mind that every subscription to this observable will initiate another descriptor write
+                            return observable.mergeWith(connection.writeDescriptor(cccDescriptor, enableValue).ignoreElements());
+                        }
                     }
                 })
                 .doOnUnsubscribe(new Action0() {
@@ -778,7 +965,7 @@ public class BleModule extends ReactContextBaseJavaModule {
                         transactions.removeSubscription(transactionId);
                     }
                 })
-                .subscribe(new Observer<Pair<BluetoothGattCharacteristic, byte[]>>() {
+                .subscribe(new Observer<byte[]>() {
                     @Override
                     public void onCompleted() {
                         promise.resolve(null);
@@ -792,43 +979,153 @@ public class BleModule extends ReactContextBaseJavaModule {
                     }
 
                     @Override
-                    public void onNext(Pair<BluetoothGattCharacteristic, byte[]> result) {
-                        sendNotification(
-                                device.getMacAddress(),
-                                UUIDConverter.fromUUID(serviceUUID),
-                                result.second,
-                                transactionId,
-                                result.first);
+                    public void onNext(byte[] bytes) {
+                        characteristic.logValue("Notification from", bytes);
+                        WritableArray jsResult = Arguments.createArray();
+                        jsResult.pushNull();
+                        jsResult.pushMap(characteristic.toJSObject(bytes));
+                        jsResult.pushString(transactionId);
+                        sendEvent(Event.ReadEvent, jsResult);
                     }
                 });
 
         transactions.replaceSubscription(transactionId, subscription);
     }
 
+
+    // Mark: Characteristics getters ---------------------------------------------------------------
+
+    @Nullable
+    private Characteristic getCharacteristicOrReject(@NonNull final String deviceId,
+                                                     @NonNull final String serviceUUID,
+                                                     @NonNull final String characteristicUUID,
+                                                     @NonNull Promise promise) {
+
+        final UUID[] UUIDs = UUIDConverter.convert(serviceUUID, characteristicUUID);
+        if (UUIDs == null) {
+            BleError.invalidUUIDs(serviceUUID, characteristicUUID).reject(promise);
+            return null;
+        }
+
+        final Device device = connectedDevices.get(deviceId);
+        if (device == null) {
+            BleError.deviceNotConnected(deviceId).reject(promise);
+            return null;
+        }
+
+        final Service service = device.getServiceByUUID(UUIDs[0]);
+        if (service == null) {
+            BleError.serviceNotFound(serviceUUID).reject(promise);
+            return null;
+        }
+
+        final Characteristic characteristic = service.getCharacteristicByUUID(UUIDs[1]);
+        if (characteristic == null) {
+            BleError.characteristicNotFound(characteristicUUID).reject(promise);
+            return null;
+        }
+
+        return characteristic;
+    }
+
+    @Nullable
+    private Characteristic getCharacteristicOrReject(final int serviceIdentifier,
+                                                     @NonNull final String characteristicUUID,
+                                                     @NonNull Promise promise) {
+
+        final UUID uuid = UUIDConverter.convert(characteristicUUID);
+        if (uuid == null) {
+            BleError.invalidUUIDs(characteristicUUID).reject(promise);
+            return null;
+        }
+
+        final Service service = discoveredServices.get(serviceIdentifier);
+        if (service == null) {
+            BleError.serviceNotFound(serviceIdentifier).reject(promise);
+            return null;
+        }
+
+        final Characteristic characteristic = service.getCharacteristicByUUID(uuid);
+        if (characteristic == null) {
+            BleError.characteristicNotFound(characteristicUUID).reject(promise);
+            return null;
+        }
+
+        return characteristic;
+    }
+
+    @Nullable
+    private Characteristic getCharacteristicOrReject(final int characteristicIdentifier,
+                                                     @NonNull Promise promise) {
+
+        final Characteristic characteristic = discoveredCharacteristics.get(characteristicIdentifier);
+        if (characteristic == null) {
+            BleError.characteristicNotFound(characteristicIdentifier).reject(promise);
+            return null;
+        }
+
+        return characteristic;
+    }
+
+    // Mark: Device getters -------------------------------------------------------------------
+
+    @Nullable
+    private RxBleConnection getConnectionOrReject(@NonNull final Device device,
+                                                  @NonNull Promise promise) {
+        final RxBleConnection connection = device.getConnection();
+        if (connection == null) {
+            BleError.deviceNotConnected(device.getNativeDevice().getMacAddress()).reject(promise);
+            return null;
+        }
+        return connection;
+    }
+
+    @Nullable
+    private List<Service> getServicesOrReject(@NonNull final Device device,
+                                              @NonNull Promise promise) {
+        final List<Service> services = device.getServices();
+        if (services == null) {
+            BleError.deviceServicesNotDiscovered(device.getNativeDevice().getMacAddress()).reject(promise);
+            return null;
+        }
+        return services;
+    }
+
+    @Nullable
+    private Device getDeviceOrReject(@NonNull final String deviceId,
+                                     @NonNull Promise promise) {
+        final Device device = connectedDevices.get(deviceId);
+        if (device == null) {
+            BleError.deviceNotConnected(deviceId).reject(promise);
+            return null;
+        }
+        return device;
+    }
+
     // Mark: Private -------------------------------------------------------------------------------
 
-    private void sendEvent(Event event, @Nullable Object params) {
+    private void sendEvent(@NonNull Event event, @Nullable Object params) {
         getReactApplicationContext()
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                 .emit(event.name, params);
     }
 
-    private void sendNotification(final String deviceId,
-                                  final String serviceUUID,
-                                  final byte[] value,
-                                  final String transactionId,
-                                  final BluetoothGattCharacteristic characteristic) {
+    private void cleanServicesAndCharacteristicsForDevice(@NonNull Device device) {
+        for (int i = discoveredServices.size() - 1; i >=0; i--) {
+            int key = discoveredServices.keyAt(i);
+            Service service = discoveredServices.get(key);
 
-        WritableMap jsObject = converter.characteristic.toJSObject(characteristic);
-        jsObject.putString("deviceID", deviceId);
-        jsObject.putString("serviceUUID", serviceUUID);
-        jsObject.putString("value", Base64Converter.encode(value));
+            if (service.getDevice().getNativeDevice().getMacAddress().equals(device.getNativeDevice().getMacAddress())) {
+                discoveredServices.remove(key);
+            }
+        }
+        for (int i = discoveredCharacteristics.size() - 1; i >=0; i--) {
+            int key = discoveredCharacteristics.keyAt(i);
+            Characteristic characteristic = discoveredCharacteristics.get(key);
 
-        WritableArray jsResult = Arguments.createArray();
-        jsResult.pushNull();
-        jsResult.pushMap(jsObject);
-        jsResult.pushString(transactionId);
-
-        sendEvent(Event.ReadEvent, jsResult);
+            if (characteristic.getService().getDevice().getNativeDevice().getMacAddress().equals(device.getNativeDevice().getMacAddress())) {
+                discoveredCharacteristics.remove(key);
+            }
+        }
     }
 }

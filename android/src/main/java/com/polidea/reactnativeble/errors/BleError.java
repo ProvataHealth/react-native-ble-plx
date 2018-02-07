@@ -2,9 +2,6 @@ package com.polidea.reactnativeble.errors;
 
 import android.support.annotation.NonNull;
 
-import java.util.ArrayList;
-import java.util.List;
-
 public class BleError {
     public static Error unknown() {
         return new Error("Unknown error", 0);
@@ -31,11 +28,19 @@ public class BleError {
     }
 
     static public Error characteristicNotFound(String uuid) {
-        return new Error("Characteristic " + uuid + " not found", 503);
+        return new Error("Characteristic with uuid " + uuid + " not found", 503);
+    }
+
+    static public Error characteristicNotFound(int id) {
+        return new Error("Characteristic with id " + id + " not found", 503);
     }
 
     static public Error serviceNotFound(String uuid) {
-        return new Error("Service " + uuid + " not found", 504);
+        return new Error("Service with uuid " + uuid + " not found", 504);
+    }
+
+    static public Error serviceNotFound(int id) {
+        return new Error("Service with id " + id + " not found", 504);
     }
 
     static public Error invalidWriteDataForCharacteristic(String data, String uuid) {
@@ -44,5 +49,9 @@ public class BleError {
 
     static public Error cannotMonitorCharacteristic(String uuid) {
         return new Error("Characteristic " + uuid + " cannot be monitored as it doesn't support notifications or indications", 506);
+    }
+
+    static public Error deviceServicesNotDiscovered(String deviceUuid) {
+        return new Error("Services for device " + deviceUuid + " not discovered. First you need to call discoverAllServicesAndCharacteristicsForDevice", 507);
     }
 }
