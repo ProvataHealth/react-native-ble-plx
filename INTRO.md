@@ -1,4 +1,6 @@
-# Getting started
+<p align="center">
+  <a href="https://github.com/Polidea/react-native-ble-plx"><img alt="react-native-ble-plx" src="logo.png" /></a>
+</p>
 
 This guide is an introduction to BLE stack and APIs exported by this library. All examples
 will be based on CC2541 SensorTag.
@@ -9,11 +11,14 @@ First step is to create BleManager instance which is an entry point to all avail
 Make sure to create it after application started its execution. For example we can do it in
 Component's constructor:
 
-```javascript
-    constructor() {
-        super()
-        this.manager = new BleManager()
-        ...
+```js
+import { BleManager } from 'react-native-ble-plx';
+
+constructor() {
+    super();
+    this.manager = new BleManager();
+    ...
+}
 ```
 
 Only one instance of BleManager is allowed. When you don't need any BLE functionality you
@@ -25,9 +30,9 @@ recreate `BleManager` later on as we did above.
 When iOS application launches BLE stack is not immediately available and we need to check its status.
 To detect current state and following state changes we can use `onStateChange()` function:
 
-```javascript
+```js
 componentWillMount() {
-    var subscription = this.manager.onStateChange((state) => {
+    const subscription = this.manager.onStateChange((state) => {
         if (state === 'PoweredOn') {
             this.scanAndConnect();
             subscription.remove();
@@ -41,7 +46,7 @@ componentWillMount() {
 Devices needs to be scanned first to be able to connect to them. There is a simple function
 which allows only one callback to be registered to handle detected devices:
 
-```javascript
+```js
 scanAndConnect() {
     this.manager.startDeviceScan(null, null, (error, device) => {
         if (error) {
@@ -59,7 +64,7 @@ scanAndConnect() {
 
             // Proceed with connection.
         }
-    }
+    });
 }
 ```
 
@@ -81,13 +86,11 @@ device.connect()
         return device.discoverAllServicesAndCharacteristics()
     })
     .then((device) => {
-        return this.doOtherWork(device)
+       // Do work on device with services and characteristics
     })
-    .then(() => {
-        // Handle result
-    }, (error) => {
+    .catch((error) => {
         // Handle errors
-    })
+    });
 ```
 
 Discovery of services and characteristics is required to be executed only once. Additionally
@@ -95,7 +98,10 @@ it can be a long process depending on number of characteristics and services ava
 
 ## Read, write and monitor values
 
-After successful discovery of services you can call `readCharacteristicForDevice()`,
-`writeCharacteristicWithResponseForDevice()`, `monitorCharacteristicForDevice()` and
-other functions which are described in detail in documentation.
+After successful discovery of services you can call 
+* {@link #blemanagerreadcharacteristicfordevice|BleManager.readCharacteristicForDevice()},
+* {@link #blemanagerwritecharacteristicwithresponsefordevice|BleManager.writeCharacteristicWithResponseForDevice()}, 
+* {@link #blemanagermonitorcharacteristicfordevice|BleManager.monitorCharacteristicForDevice()}
+
+and other functions which are described in detail in documentation.
 

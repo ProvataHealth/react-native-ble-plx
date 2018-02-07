@@ -1,7 +1,20 @@
-// @flow 
+// @flow
 
-export { default as BleManager } from './src/BleManager'
-export { default as Device } from './src/Device'
-export { default as Service } from './src/Service'
-export { default as Characteristic } from './src/Characteristic'
+export { BleManager } from './src/BleManager'
+export { Device } from './src/Device'
+export { Service } from './src/Service'
+export { Characteristic } from './src/Characteristic'
 export { fullUUID } from './src/Utils'
+export { State, LogLevel } from './src/TypeDefinition'
+
+export type {
+  Subscription,
+  DeviceId,
+  UUID,
+  TransactionId,
+  Base64,
+  ScanOptions,
+  ConnectionOptions,
+  BleManagerOptions,
+  BleRestoredState
+} from './src/TypeDefinition'
